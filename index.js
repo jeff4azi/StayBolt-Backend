@@ -9,30 +9,31 @@ dotenv.config();
 const app = express();
 
 // ---------------------------------------------------------------------------
-// CORS
+// CORS — temporarily open to all origins for debugging
 // ---------------------------------------------------------------------------
-const allowedOrigins = [
-  "http://localhost:5173",
-  "https://stay-bolt.vercel.app", // update with your real production URL
-];
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // allow requests with no origin (mobile apps, curl, etc.)
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      callback(new Error("Not allowed by CORS"));
-    },
-    methods: ["GET", "POST", "DELETE", "PUT", "PATCH"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  }),
-);
+// const allowedOrigins = [
+//   "http://localhost:5173",
+//   "https://stay-bolt.vercel.app",
+// ];
+
+// app.use(
+//   cors({
+//     origin: function (origin, callback) {
+//       // allow requests with no origin (mobile apps, curl, etc.)
+//       if (!origin) return callback(null, true);
+//       if (allowedOrigins.includes(origin)) return callback(null, true);
+//       callback(new Error("Not allowed by CORS"));
+//     },
+//     methods: ["GET", "POST", "DELETE", "PUT", "PATCH"],
+//     allowedHeaders: ["Content-Type", "Authorization"],
+//   }),
+// );
+
+app.use(cors());
+app.options("*", cors());
 
 app.use(express.json({ limit: "20mb" }));
-
-// Explicitly handle preflight requests for all routes
-app.options("*", cors());
 
 // ---------------------------------------------------------------------------
 // Cloudinary
