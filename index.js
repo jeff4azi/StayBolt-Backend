@@ -14,6 +14,7 @@ const app = express();
 const allowedOrigins = [
   "http://localhost:5173",
   "https://stay-bolt.vercel.app", // update with your real production URL
+  "https://stay-bolt.vercel.app9e9ewr9", // update with your real production URL
 ];
 
 app.use(
