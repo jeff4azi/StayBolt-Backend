@@ -14,7 +14,6 @@ const app = express();
 const allowedOrigins = [
   "http://localhost:5173",
   "https://stay-bolt.vercel.app", // update with your real production URL
-  "https://stay-bolt.vercel.app9e9ewr9", // update with your real production URL
 ];
 
 app.use(
@@ -118,6 +117,30 @@ app.delete("/delete-image", async (req, res) => {
 
   try {
     await cloudinary.uploader.destroy(public_id);
+    res.json({ message: "Image deleted from Cloudinary" });
+  } catch (error) {
+    console.error("Cloudinary delete error:", error);
+    res.status(500).json({ error: error.message ?? "Delete failed" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /delete-image-by-url
+// Delete a single image from Cloudinary by its URL (extracts public_id).
+// Body: { url: string }
+// ---------------------------------------------------------------------------
+app.delete("/delete-image-by-url", async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: "url is required" });
+
+  const pid = extractPublicId(url);
+  if (!pid)
+    return res
+      .status(400)
+      .json({ error: "Could not extract public_id from URL" });
+
+  try {
+    await cloudinary.uploader.destroy(pid);
     res.json({ message: "Image deleted from Cloudinary" });
   } catch (error) {
     console.error("Cloudinary delete error:", error);
