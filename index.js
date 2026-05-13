@@ -33,7 +33,7 @@ app.use(
 app.use(express.json({ limit: "20mb" }));
 
 // Explicitly handle preflight requests for all routes
-app.options("/(.*)", cors());
+app.options("/{*splat}", cors());
 
 // ---------------------------------------------------------------------------
 // Cloudinary
