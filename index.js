@@ -3,6 +3,7 @@ import { v2 as cloudinary } from "cloudinary";
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 import cors from "cors";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -50,6 +51,20 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY, // service_role key
 );
+
+const RATING_SECRET_SALT =
+  process.env.SECRET_SALT || process.env.RATING_SECRET_SALT || "dev-rating-salt";
+const RATING_COOLDOWN_MS = Number(process.env.RATING_COOLDOWN_MS ?? 15000);
+const ELIGIBILITY_TOKEN_TTL_MS = Number(
+  process.env.RATING_ELIGIBILITY_TOKEN_TTL_MS ?? 60 * 60 * 1000,
+);
+const meaningfulInteractions = new Set([
+  "time_on_page",
+  "contact_clicked",
+  "gallery_opened",
+  "significant_scroll",
+]);
+const recentRatingSubmissions = new Map();
 
 // ---------------------------------------------------------------------------
 // Health check
@@ -321,6 +336,149 @@ app.delete("/delete-agent-avatar", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /property-ratings/eligibility
+// Creates a short-lived signed token after a meaningful property interaction.
+// Body: { listing_id, fingerprint, interaction }
+// ---------------------------------------------------------------------------
+app.post("/property-ratings/eligibility", async (req, res) => {
+  const { listing_id, fingerprint, interaction } = req.body;
+
+  if (!listing_id) return res.status(400).json({ error: "listing_id is required" });
+  if (!meaningfulInteractions.has(interaction)) {
+    return res.status(400).json({ error: "Unknown rating eligibility event" });
+  }
+
+  const normalizedFingerprint = normalizeFingerprint(fingerprint);
+  const ipHash = hashIp(getClientIp(req));
+
+  if (!normalizedFingerprint && !ipHash) {
+    return res.status(400).json({ error: "A fingerprint or IP is required" });
+  }
+
+  const token = signEligibilityToken({
+    listing_id,
+    fingerprint: normalizedFingerprint,
+    ip_hash: ipHash,
+    interaction,
+    expires_at: Date.now() + ELIGIBILITY_TOKEN_TTL_MS,
+  });
+
+  res.json({ eligibilityToken: token });
+});
+
+// ---------------------------------------------------------------------------
+// POST /property-ratings
+// Anonymous-friendly property rating with fingerprint/IP identity and cooldown.
+// Body: { listing_id, rating, fingerprint, user_id?, eligibilityToken }
+// ---------------------------------------------------------------------------
+app.post("/property-ratings", async (req, res) => {
+  const { listing_id, rating, fingerprint, eligibilityToken } = req.body;
+  const stars = Number(rating);
+
+  if (!listing_id) return res.status(400).json({ error: "listing_id is required" });
+  if (!Number.isInteger(stars) || stars < 1 || stars > 5) {
+    return res.status(400).json({ error: "Rating must be a whole number from 1 to 5" });
+  }
+
+  const normalizedFingerprint = normalizeFingerprint(fingerprint);
+  const ipHash = hashIp(getClientIp(req));
+  const userId = await resolveAuthenticatedUserId(req);
+
+  if (!userId && !normalizedFingerprint && !ipHash) {
+    return res.status(400).json({ error: "A rating identity is required" });
+  }
+
+  const eligibility = verifyEligibilityToken(eligibilityToken);
+  if (
+    !eligibility ||
+    eligibility.listing_id !== listing_id ||
+    (eligibility.fingerprint &&
+      normalizedFingerprint &&
+      eligibility.fingerprint !== normalizedFingerprint) ||
+    (eligibility.ip_hash && eligibility.ip_hash !== ipHash)
+  ) {
+    return res.status(403).json({
+      error: "Interact with the property before rating it.",
+    });
+  }
+
+  const cooldownKeys = getRatingCooldownKeys(
+    listing_id,
+    userId,
+    normalizedFingerprint,
+    ipHash,
+  );
+  if (isRateLimited(cooldownKeys)) {
+    return res.status(429).json({ error: "Please wait a moment before rating again." });
+  }
+
+  try {
+    const { data: listing, error: listingError } = await supabase
+      .from("listings")
+      .select("agent_id")
+      .eq("id", listing_id)
+      .maybeSingle();
+    if (listingError) throw listingError;
+    if (!listing) return res.status(404).json({ error: "Property not found" });
+
+    if (userId && listing.agent_id) {
+      const { data: agent, error: agentError } = await supabase
+        .from("agents")
+        .select("user_id")
+        .eq("id", listing.agent_id)
+        .maybeSingle();
+      if (agentError) throw agentError;
+      if (agent?.user_id === userId) {
+        return res.status(403).json({ error: "Agents cannot rate their own property." });
+      }
+    }
+
+    const existing = await findExistingPropertyRating(
+      listing_id,
+      userId,
+      normalizedFingerprint,
+      ipHash,
+    );
+
+    const ratingRow = {
+      listing_id,
+      user_id: userId,
+      fingerprint: normalizedFingerprint,
+      ip_hash: ipHash,
+      rating: stars,
+    };
+
+    const dbResult = existing
+      ? await supabase
+          .from("property_ratings")
+          .update(ratingRow)
+          .eq("id", existing.id)
+          .select("rating")
+          .single()
+      : await supabase
+          .from("property_ratings")
+          .insert(ratingRow)
+          .select("rating")
+          .single();
+
+    if (dbResult.error) throw dbResult.error;
+
+    for (const key of cooldownKeys) {
+      recentRatingSubmissions.set(key, Date.now());
+    }
+    pruneCooldowns();
+
+    res.json({ rating: dbResult.data.rating });
+  } catch (error) {
+    if (error?.code === "23505") {
+      return res.status(409).json({ error: "This property has already been rated." });
+    }
+    console.error("Error saving property rating:", error);
+    res.status(500).json({ error: error.message ?? "Could not save rating" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Utility: extract Cloudinary public_id from a secure_url
 // e.g. https://res.cloudinary.com/<cloud>/image/upload/v123/staybolt/abc.jpg
 //   → staybolt/abc
@@ -334,6 +492,120 @@ function extractPublicId(url) {
   } catch {
     return null;
   }
+}
+
+function getClientIp(req) {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  if (typeof forwardedFor === "string" && forwardedFor.length > 0) {
+    return forwardedFor.split(",")[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || "";
+}
+
+function hashIp(ip) {
+  if (!ip) return null;
+  return crypto
+    .createHash("sha256")
+    .update(`${ip}${RATING_SECRET_SALT}`)
+    .digest("hex");
+}
+
+function normalizeFingerprint(fingerprint) {
+  if (typeof fingerprint !== "string") return null;
+  const normalized = fingerprint.trim();
+  if (!normalized || normalized.length > 200) return null;
+  return normalized;
+}
+
+function signEligibilityToken(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", RATING_SECRET_SALT)
+    .update(body)
+    .digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function verifyEligibilityToken(token) {
+  if (typeof token !== "string" || !token.includes(".")) return null;
+  const [body, signature] = token.split(".");
+  const expectedSignature = crypto
+    .createHmac("sha256", RATING_SECRET_SALT)
+    .update(body)
+    .digest("base64url");
+
+  const signatureBuffer = Buffer.from(signature);
+  const expectedSignatureBuffer = Buffer.from(expectedSignature);
+  if (
+    signatureBuffer.length !== expectedSignatureBuffer.length ||
+    !crypto.timingSafeEqual(signatureBuffer, expectedSignatureBuffer)
+  ) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    if (!payload.expires_at || Date.now() > payload.expires_at) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveAuthenticatedUserId(req) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : null;
+
+  if (token) {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (!error && data?.user?.id) return data.user.id;
+  }
+
+  return null;
+}
+
+async function findExistingPropertyRating(listingId, userId, fingerprint, ipHash) {
+  const filters = [];
+  if (userId) filters.push(`user_id.eq.${userId}`);
+  if (fingerprint) filters.push(`fingerprint.eq.${fingerprint}`);
+  if (ipHash) filters.push(`ip_hash.eq.${ipHash}`);
+  if (filters.length === 0) return null;
+
+  const { data, error } = await supabase
+    .from("property_ratings")
+    .select("id")
+    .eq("listing_id", listingId)
+    .or(filters.join(","))
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+function pruneCooldowns() {
+  const oldestAllowed = Date.now() - RATING_COOLDOWN_MS * 4;
+  for (const [key, submittedAt] of recentRatingSubmissions.entries()) {
+    if (submittedAt < oldestAllowed) recentRatingSubmissions.delete(key);
+  }
+}
+
+function getRatingCooldownKeys(listingId, userId, fingerprint, ipHash) {
+  return [
+    userId ? `${listingId}:user:${userId}` : null,
+    fingerprint ? `${listingId}:fingerprint:${fingerprint}` : null,
+    ipHash ? `${listingId}:ip:${ipHash}` : null,
+  ].filter(Boolean);
+}
+
+function isRateLimited(keys) {
+  const now = Date.now();
+  return keys.some((key) => {
+    const lastSubmittedAt = recentRatingSubmissions.get(key) ?? 0;
+    return now - lastSubmittedAt < RATING_COOLDOWN_MS;
+  });
 }
 
 // ---------------------------------------------------------------------------
